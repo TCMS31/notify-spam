@@ -1,0 +1,58 @@
+plugins:
+  - rubocop-rails
+  - rubocop-minitest
+
+AllCops:
+  TargetRubyVersion: 3.1
+  NewCops: enable
+  SuggestExtensions: false
+  Exclude:
+    - "bin/**/*"
+    - "db/schema.rb"
+    - "node_modules/**/*"
+    - "tmp/**/*"
+    - "vendor/**/*"
+
+# Rails ships a Rakefile/config with double quotes; keep the whole tree on one style.
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
+
+Style/Documentation:
+  Enabled: false
+
+# Test names and validation messages read better as sentences than at 100 chars.
+Layout/LineLength:
+  Max: 120
+
+Metrics/BlockLength:
+  Exclude:
+    - "config/**/*"
+    - "test/**/*"
+
+Metrics/MethodLength:
+  Max: 15
+
+# The enum uses the provider's PascalCase vocabulary, which Active Record turns
+# into predicate methods of the same name.
+Naming/MethodName:
+  Exclude:
+    - "app/models/spam_report.rb"
+
+Rails/Output:
+  Exclude:
+    - "db/seeds.rb"
+    - "lib/tasks/**/*.rake"
+    - "script/**/*"
+
+# Migrations in this app are written against the versions actually deployed.
+Rails/CreateTableWithTimestamps:
+  Enabled: false
+
+# Minitest's refute_* reads better than Rails' assert_not_* and is used
+# consistently across the suite.
+Rails/RefuteMethods:
+  Enabled: false
+
+# A behavioural test legitimately asserts several facts about one outcome.
+Minitest/MultipleAssertions:
+  Max: 10
