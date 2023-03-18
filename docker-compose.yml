@@ -1,0 +1,44 @@
+name: notify-spam
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: notify_spam
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-notify_spam}
+      POSTGRES_DB: notify_spam_production
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notify_spam"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      target: runtime
+    # Host ports live in the 8800 range so this stack never collides with a
+    # local Rails server on 3000.
+    ports:
+      - "8800:3000"
+    environment:
+      RAILS_ENV: production
+      RAILS_LOG_TO_STDOUT: "1"
+      DATABASE_URL: postgres://notify_spam:${POSTGRES_PASSWORD:-notify_spam}@db:5432/notify_spam_production
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set SECRET_KEY_BASE, e.g. bin/rails secret}
+      WEBHOOK_USERNAME: ${WEBHOOK_USERNAME:?set a webhook username}
+      WEBHOOK_PASSWORD: ${WEBHOOK_PASSWORD:?set a webhook password}
+      SLACK_API_TOKEN: ${SLACK_API_TOKEN:-}
+      SLACK_CHANNEL_NAME: ${SLACK_CHANNEL_NAME:-}
+      NOTIFIER: ${NOTIFIER:-slack}
+    depends_on:
+      db:
+        condition: service_healthy
+    # Migrations run on start: the schema is small and the app is the only writer.
+    command: >
+      sh -c "bundle exec rails db:prepare && bundle exec puma -C config/puma.rb"
+
+volumes:
+  pgdata:
