@@ -1,338 +1,244 @@
-# Spam Notifier
+# notify-spam
 
-A small Rails API that receives a mail provider's bounce webhook (the payload shape is
-Postmark's: `RecordType`, `Type`, `TypeCode`, `Email`, `From`, `BouncedAt`…), stores every
-delivery event, and raises a Slack alert for the one event type that needs a human —
-a spam complaint.
+A Rails 7 API-only service that receives a mail provider's bounce webhook — the payload is
+Postmark's schema verbatim (`RecordType`, `Type`, `TypeCode`, `Email`, `From`, `BouncedAt`, …) —
+stores every delivery event it is handed, and posts a Slack message to your own team for the one
+event that needs a human: a spam complaint.
 
-It is a webhook receiver, not a dashboard: one `POST` endpoint plus a health probe. The
-interesting part is delivery correctness — providers retry, Slack fails, and neither may
-turn into a duplicate alert or a report that claims to have been sent when it was not.
+The name is narrower than the thing. It stores all four event types the provider sends
+(`SpamNotification`, `HardBounce`, `SoftBounce`, `Delivery`), not only spam, and "notify" means
+*post into a channel your team watches* — nothing here emails anybody, despite the generator's
+`app/mailers/` directory still sitting in the tree. There is no UI and no read side: one `POST`,
+one liveness probe, one table.
 
----
+## The one request it serves
 
-## Captured output
-
-There is no UI. The transcripts below come from a real local run; the full captures live in
-[`docs/`](docs).
-
-| Capture | What it shows |
-| ------- | ------------- |
-| [`docs/api-transcripts.md`](docs/api-transcripts.md) | Every request/response pair: ingest, replay, rejection, auth |
-| [`docs/pipeline-evidence.md`](docs/pipeline-evidence.md) | The rendered Slack alert, what ends up stored, and the sweep |
-| [`docs/test-output.md`](docs/test-output.md) | Test and lint runs, plus the mutations that prove the suite fails |
-
-A spam complaint is stored and an alert is queued:
+The provider posts its own PascalCase body. The response comes back in snake_case, before Slack has
+been contacted. The command is the runnable local form; the response bodies are abridged from the
+captured run in [`docs/api-transcripts.md`](docs/api-transcripts.md), which used port 8800 with
+webhook auth enabled.
 
 ```console
-$ curl -sS -u postmark:****** -X POST http://127.0.0.1:8800/api/v1/spam_reports \
-    -H "Content-Type: application/json" -d '<payload>'
-{"id":6,...,"notified_at":null,"notification_attempts":0,"duplicate":false,"notification_enqueued":true}
+$ curl -sS -X POST http://localhost:3000/api/v1/spam_reports \
+    -H "Content-Type: application/json" \
+    -d '{"RecordType":"Bounce","Type":"SpamNotification","TypeCode":512,
+         "Name":"Spam notification","Tag":"welcome-email","MessageStream":"outbound",
+         "Description":"The recipient marked the message as spam.",
+         "Email":"annoyed@example.com","From":"alerts@example.com",
+         "BouncedAt":"2023-03-14T17:29:39Z"}'
+
+{"id":6, … ,"notified_at":null,"notification_attempts":0,
+ "duplicate":false,"notification_enqueued":true}
 < HTTP 201
 ```
 
-The provider retries the same event; it is recognised, and nothing is sent twice:
+Send that exact body again and the answer changes, because the event is recognised as one already
+stored:
 
 ```console
-$ curl -sS -u postmark:****** -X POST http://127.0.0.1:8800/api/v1/spam_reports \
-    -H "Content-Type: application/json" -d '<payload>'
-{"id":6,...,"notified_at":"2026-09-25T15:29:04.512Z","duplicate":true,"notification_enqueued":false}
+{"id":6, … ,"notified_at":"2026-09-25T15:31:33.061Z",
+ "duplicate":true,"notification_enqueued":false}
 < HTTP 200
 ```
 
-And this is the alert itself, produced by driving the real `SlackNotifier` against a
-recording double (`bin/rails runner script/slack_preview.rb`):
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| `POST` | `/api/v1/spam_reports` | Ingest one bounce or complaint event |
+| `GET`  | `/up` | Liveness probe — queries the database, deliberately never Slack, so an outage at the notification provider cannot pull the container out of rotation |
 
-```console
-chat.postMessage channel=#email-alerts
-text:
-  | Request with Spam Payload detected!
-  |  *Type*: SpamNotification
-  |  *Email*: annoyed@example.com
-  |  *Description*: The recipient marked the message as spam.
-receipt: slack:1678814979.000100
-```
+`POST` answers `201` for a new event, `200` for a replay, `422` for an invalid payload, `400` for
+a body that is not JSON, and `401` when webhook credentials are configured and not supplied. Every
+one of those pairs, captured from a real local run, is in
+[`docs/api-transcripts.md`](docs/api-transcripts.md).
 
----
+## Delivery correctness is the whole problem
 
-## Architecture
+Ingesting a webhook is trivial. What is not trivial is that mail providers retry on any non-2xx
+response, Slack sometimes refuses, and neither may turn into a duplicate alert or into a stored
+report that claims to have been delivered when it was not. Four rules carry that, and each one has
+a test that names it:
 
-```mermaid
-flowchart TB
-    provider["Mail provider<br/>bounce webhook"]
+- **An event has an identity.** `SpamReport` derives a SHA-256 `event_key` from the fields that
+  make two deliveries the same event, backed by a partial unique index. A replay is a cheap `200`
+  with `duplicate: true` and no second row — `a replayed webhook is recognised and neither stored
+  nor alerted twice`. Two concurrent deliveries that both get past the `SELECT` are resolved by
+  catching `RecordNotUnique` and returning whichever row won — `loses the insert race gracefully
+  and reports a duplicate`.
+- **Delivery is recorded after it happens.** `notified_at` and `notification_receipt` are written
+  only once Slack has accepted; a failure writes `notification_error` and increments
+  `notification_attempts` and leaves `notified_at` nil — `a failed delivery does not mark the
+  report notified`. The job returns early if the report is already notified — `an already-notified
+  report is a no-op`.
+- **Failures are isolated per report.** One job per report, so a revoked token or a missing
+  channel for one alert cannot abort another — `one failing report does not stop the others from
+  being delivered`. `retry_on` covers `Notifier::DeliveryError` and nothing else, so a bug in this
+  codebase fails on the first attempt instead of being retried five times.
+- **Only one event type alerts.** `SpamNotification` plus `TypeCode` 512 (Postmark's code for a
+  spam complaint, overridable with `SPAM_TYPE_CODE`). A `SpamNotification` carrying a different
+  code is stored and stays quiet — `a SpamNotification carrying a different type code is stored but
+  not alerted on`.
 
-    subgraph edge["HTTP edge"]
-        auth["WebhookAuthentication<br/>shared-secret basic auth"]
-        middleware["SnakeCaseParams<br/>PascalCase to snake_case"]
-        controller["Api::V1::SpamReportsController<br/>HTTP adapter only"]
-    end
+Nothing opens a socket while the app boots: `config/initializers/notifications.rb` only reads
+configuration, and `SlackNotifier` builds its client lazily on first delivery. The suite enforces
+that with `WebMock.disable_net_connect!(allow_localhost: false)` — a change that put a live call
+back on the ingestion path fails the suite rather than posting into a real channel.
 
-    subgraph domain["Domain"]
-        ingestion["SpamReportIngestion<br/>validate, de-duplicate, enqueue"]
-        model["SpamReport<br/>validation, enum, delivery state"]
-    end
+Two rough edges the HTTP layer smooths over: an unrecognised `Type` escapes Active Record's enum
+setter as an `ArgumentError`, so `SpamReport#report_type=` catches it and reports a validation
+failure naming the four accepted values instead of an empty `500`; and `SnakeCaseParams` leaves an
+unparsable body alone so `ApplicationController` can render a `400`.
 
-    subgraph delivery["Delivery, out of band"]
-        job["SpamNotificationJob<br/>retry, idempotency, isolation"]
-        registry["NotifierRegistry"]
-        slack["SlackNotifier"]
-        null["NullNotifier<br/>fallback when unconfigured"]
-    end
-
-    db[("PostgreSQL<br/>unique index on event_key")]
-    api["Slack Web API"]
-
-    provider --> auth --> middleware --> controller --> ingestion
-    ingestion --> model --> db
-    ingestion -- "spam complaint only" --> job
-    job --> registry
-    registry --> slack
-    registry -.-> null
-    slack --> api
-    job -- "mark_notified! after success" --> db
-```
-
-Dependencies point inward. The controller knows HTTP and nothing else; `SpamReportIngestion`
-owns the rules; `SpamReport` owns validation and its own delivery bookkeeping; the notifiers
-are the only code that knows Slack exists, and they are reached through a registry so the
-layers above never name a provider.
-
-## Request flow
+## The life of one alert
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant P as Mail provider
-    participant A as API
-    participant D as PostgreSQL
-    participant Q as Active Job
-    participant S as Slack
+stateDiagram-v2
+    [*] --> Stored : POST accepted
 
-    P->>A: POST /api/v1/spam_reports (PascalCase JSON)
-    A->>A: authenticate, normalize keys, validate
-    A->>D: SELECT by event_key
+    Stored : notified_at NULL, notification_attempts 0
+    Stored --> Recorded : any other Type, or another TypeCode
+    Recorded : kept for the record, no job is ever enqueued
+    Recorded --> [*]
 
-    alt Event already stored
-        D-->>A: existing report
-        A-->>P: 200 duplicate=true (no alert)
-    else New event
-        A->>D: INSERT spam_report
-        A-->>P: 201 created
-        opt Type=SpamNotification and TypeCode=512
-            A->>Q: enqueue SpamNotificationJob(report_id)
-            Q->>S: chat.postMessage
-            alt Slack accepts
-                S-->>Q: ok, ts
-                Q->>D: UPDATE notified_at, notification_receipt
-            else Slack fails
-                S-->>Q: error
-                Q->>D: UPDATE notification_error, notification_attempts
-                Q->>Q: retry, up to 5 attempts
-            end
-        end
-    end
+    Stored --> Queued : Type SpamNotification and TypeCode 512
+    Queued : SpamNotificationJob carries the report id, nothing more
+
+    Queued --> Delivered : Slack accepted the message
+    Delivered : mark_notified! stamps notified_at and the receipt
+    Delivered --> Delivered : a replay or a job retry is a no-op
+    Delivered --> [*]
+
+    Queued --> Failed : Notifier DeliveryError
+    Failed : notification_error stored, attempts incremented, notified_at still NULL
+    Failed --> Queued : retry_on, up to 5 attempts
+    Failed --> Unsent : attempts exhausted
+    Unsent : awaiting_notification still finds it
+    Unsent --> Queued : bin/rails notifications:sweep
 ```
 
-The response is returned before Slack is contacted. A Slack outage therefore costs the
-provider nothing: it still gets its `201`, and the alert is retried in the background.
+The `Unsent → Queued` edge is why `bin/rails notifications:sweep` exists. Because `notified_at`
+records what actually reached Slack rather than what was attempted, the pending set is exact and
+re-queueing it cannot double-send.
 
----
+One insert per request means there is no N+1 here and nothing to paginate. The three indexes on
+`spam_reports` match the three real access patterns: the unique `event_key` lookup that runs on
+*every* request, `[report_type, type_code, bounced_at]`, and a partial index on
+`notified_at IS NULL` for the sweep. That reasoning is analytic — no throughput was measured.
 
-## Quickstart
+## Running it locally
 
-Requires Ruby 3.1.3 and a running PostgreSQL. No Slack credentials are needed — without
-them the app logs the alert instead of sending it.
+Ruby 3.1.3 (pinned in `.ruby-version` and the `Gemfile`) and a PostgreSQL you can connect to. No
+Slack credentials are needed — with none set the app falls back to `NullNotifier` and logs the
+alert instead of sending it.
 
 ```bash
 bundle install
-bin/rails db:prepare db:seed
-bin/rails server -p 3000
+bin/rails db:prepare db:seed     # five representative events, idempotent
+bin/rails server                 # port 3000
 ```
 
 ```bash
-curl -sS -X POST http://localhost:3000/api/v1/spam_reports \
-  -H "Content-Type: application/json" \
-  -d '{"RecordType":"Bounce","Type":"SpamNotification","TypeCode":512,
-       "Name":"Spam notification","Tag":"welcome-email","MessageStream":"outbound",
-       "Description":"The recipient marked the message as spam.",
-       "Email":"annoyed@example.com","From":"alerts@example.com",
-       "BouncedAt":"2023-03-14T17:29:39Z"}'
+bin/rails test                             # 63 runs, 201 assertions, 0 failures
+bundle exec rubocop                        # 48 files inspected, no offenses
+bin/rails notifications:sweep              # re-queue alerts that never went out
+bin/rails runner script/slack_preview.rb   # render the alert without sending it
 ```
 
-To actually post to Slack, copy `.env.example` to `.env` and fill in `SLACK_API_TOKEN`
-(a bot token with `chat:write`) and `SLACK_CHANNEL_NAME`.
+Both result lines are reproduced in [`docs/test-output.md`](docs/test-output.md), which also records
+two mutations of the delivery logic and the failures they produced — a green suite proves nothing
+unless it can go red. [`docs/pipeline-evidence.md`](docs/pipeline-evidence.md) has the rendered
+Slack alert, the stored rows, and the sweep. To post for real, copy
+[`.env.example`](.env.example) to `.env` and set `SLACK_API_TOKEN` and `SLACK_CHANNEL_NAME`.
 
-### Endpoints
+### Docker
 
-| Method | Path | Purpose |
-| ------ | ---- | ------- |
-| `POST` | `/api/v1/spam_reports` | Ingest one bounce/spam webhook event |
-| `GET`  | `/up` | Liveness probe; checks the database only |
+`Dockerfile` (multi-stage, no compiler in the runtime image, non-root `rails` user, `HEALTHCHECK`
+against `/up`) and `docker-compose.yml` (API on host port 8800, PostgreSQL 16, required secrets
+declared as `${VAR:?}` so a missing one fails immediately) are provided:
 
-`POST` answers `201` for a new event, `200` for a replay, `422` for an invalid payload,
-`400` for a body that is not JSON, and `401` when webhook credentials are configured and
-not supplied.
+```bash
+SECRET_KEY_BASE=$(bin/rails secret) WEBHOOK_USERNAME=postmark WEBHOOK_PASSWORD=… \
+  docker compose up --build
+```
 
----
+**Neither has been built or booted.** They were parse-checked with `docker compose config -q`
+only. Treat them as a starting point, not as a verified deployment.
 
-## Configuration
+## Settings
 
 Every variable is optional in development; the app runs with none of them set.
 
 | Variable | Required | Default | Purpose |
 | -------- | -------- | ------- | ------- |
-| `SLACK_API_TOKEN` | No | _(unset)_ | Slack bot token with `chat:write`. Unset means alerts are logged, not sent. |
-| `SLACK_CHANNEL_NAME` | No | _(unset)_ | Channel name or id to post into. A bare name is prefixed with `#`. |
+| `SLACK_API_TOKEN` | No | _(unset)_ | Bot token with `chat:write`. Unset means alerts are logged, not sent. |
+| `SLACK_CHANNEL_NAME` | No | _(unset)_ | Channel name or id. A bare name is prefixed with `#`. |
 | `NOTIFIER` | No | `slack` | Which channel to use: any name in `NotifierRegistry` (`slack`, `null`). |
 | `WEBHOOK_USERNAME` | In production | _(unset)_ | HTTP Basic username the provider must send. |
 | `WEBHOOK_PASSWORD` | In production | _(unset)_ | HTTP Basic password the provider must send. |
 | `ALLOW_UNAUTHENTICATED_WEBHOOK` | No | `false` | Set to `true` to let production boot with an open endpoint. |
-| `SPAM_TYPE_CODE` | No | `512` | Provider type code that marks a spam complaint. Postmark uses 512. |
-| `ACTIVE_JOB_ADAPTER` | No | `async` | Active Job backend. `async` is in-process; see Limitations. |
+| `SPAM_TYPE_CODE` | No | `512` | Provider type code that marks a spam complaint. |
+| `ACTIVE_JOB_ADAPTER` | No | `async` | Active Job backend. `async` is in-process — see the gaps below. |
 | `CORS_ORIGINS` | No | _(unset)_ | Comma-separated browser origins. Empty disables CORS entirely. |
-| `DATABASE_URL` | In production | _(unset)_ | Standard Rails connection URL; overrides `config/database.yml`. |
-| `SECRET_KEY_BASE` | In production | _(unset)_ | Rails secret. Required because `config/master.key` is not committed. |
+| `DATABASE_URL` | In production | _(unset)_ | Standard Rails connection URL, overrides `config/database.yml`. |
+| `SECRET_KEY_BASE` | In production | _(unset)_ | Required because `config/master.key` is not committed. |
 | `RAILS_MAX_THREADS` | No | `5` | Puma threads and database pool size. |
 | `PORT` | No | `3000` | Port Puma binds to. |
 
-Production refuses to boot without `WEBHOOK_USERNAME` and `WEBHOOK_PASSWORD` unless
-`ALLOW_UNAUTHENTICATED_WEBHOOK=true` is set explicitly. The endpoint triggers outbound
-Slack messages, so an open one is a way for a stranger to fill your channel.
+Webhook authentication is HTTP Basic — credentials embedded in the webhook URL, which is what
+Postmark actually offers. It is **off when unconfigured**, so local development and the suite need
+no secrets, but `config/initializers/webhook_security.rb` makes production *refuse to boot* without
+`WEBHOOK_USERNAME` and `WEBHOOK_PASSWORD` unless `ALLOW_UNAUTHENTICATED_WEBHOOK=true` is set
+explicitly: the endpoint fans out to a third party, so an open one lets a stranger fill your
+channel. Both fields are compared through a fixed-length digest with `&` rather than `&&`, so
+timing does not reveal which half was wrong.
 
----
+CORS stays off unless `CORS_ORIGINS` is set, then allows only `POST`/`OPTIONS` on `/api/*`. No
+browser is involved in a server-to-server webhook, so the generator's `origins "*"` bought nothing.
 
-## Development
+## Where the code lives, and where to extend it
 
-```bash
-bundle install
-bin/rails db:prepare        # development database
-bin/rails test              # 63 tests, no network access
-bundle exec rubocop         # lint; rubocop-rails + rubocop-minitest
-bin/rails notifications:sweep      # re-queue alerts that never went out
-bin/rails runner script/slack_preview.rb   # print the alert without sending it
-```
-
-The suite calls `WebMock.disable_net_connect!` in `test/test_helper.rb`, so **no test can
-reach Slack** — a change that put a live call back on the ingestion path would fail the
-suite rather than post into a real channel. `SlackNotifierTest` still drives the real
-`slack-ruby-client` through a WebMock stub, so the HTTP request the app would make is
-asserted, not mocked away.
-
-### Docker
-
-`Dockerfile` (multi-stage, non-root runtime user, healthcheck on `/up`) and
-`docker-compose.yml` (API on host port 8800 plus PostgreSQL) are provided:
-
-```bash
-SECRET_KEY_BASE=$(bin/rails secret) WEBHOOK_USERNAME=postmark WEBHOOK_PASSWORD=... \
-  docker compose up --build
-```
-
-These were written and parse-checked with `docker compose config`; they have not been
-built or booted.
-
----
-
-## Project structure
+Dependencies point inward. The controller knows HTTP and no rules; `SpamReportIngestion` owns the
+rules; `SpamReport` owns validation, the provider's enum vocabulary and its own delivery
+bookkeeping; the notifiers are the only code that knows Slack exists.
 
 ```
-app/
-  controllers/
-    api/v1/spam_reports_controller.rb  HTTP adapter: params in, status code out
-    concerns/webhook_authentication.rb shared-secret basic auth for the webhook
-    health_controller.rb               liveness probe (database only)
-  middlewares/
-    snake_case_params.rb               PascalCase -> snake_case at the edge
-  models/
-    spam_report.rb                     validation, enum, event key, delivery state
-  services/
-    spam_report_ingestion.rb           the ingestion rules, in one place
-  jobs/
-    spam_notification_job.rb           out-of-band delivery: retry, idempotency
-  notifiers/
-    notifier.rb                        the contract every channel implements
-    notifier_registry.rb               the extension seam
-    slack_notifier.rb                  the only class that knows about Slack
-    null_notifier.rb                   fallback when nothing is configured
-config/
-  initializers/notifications.rb        channel config; opens no sockets at boot
-  initializers/webhook_security.rb     production refuses an unprotected endpoint
-  initializers/cors.rb                 CORS off unless CORS_ORIGINS is set
-db/migrate/                            schema, including the event_key unique index
-docs/                                  captured transcripts quoted in this README
-script/slack_preview.rb                render an alert without sending it
-test/                                  63 tests; network blocked by WebMock
+app/middlewares/snake_case_params.rb          PascalCase -> snake_case, at the edge
+app/controllers/concerns/webhook_authentication.rb   shared-secret basic auth
+app/controllers/api/v1/spam_reports_controller.rb    HTTP adapter: params in, status out
+app/services/spam_report_ingestion.rb         validate -> de-duplicate -> persist -> enqueue
+app/models/spam_report.rb                     validation, enum, event_key, delivery state
+app/jobs/spam_notification_job.rb             out-of-band delivery, retry, idempotency
+app/notifiers/                                notifier.rb is the contract, registry is the seam
+lib/tasks/notifications.rake                  notifications:sweep
+script/slack_preview.rb                       render an alert without sending it
 ```
 
----
+`NotifierRegistry` is the one extension seam, and it is the one a future developer would actually
+reach for. Adding email, PagerDuty or an internal webhook is a class that implements
+`Notifier#deliver` and raises `Notifier::DeliveryError` on rejection, plus one line:
 
-## Design notes
+```ruby
+NotifierRegistry.register(:pagerduty, "PagerdutyNotifier")
+```
 
-**Nothing talks to the network at boot.** The original `config/initializers/slack.rb`
-raised unless `SLACK_API_TOKEN` was set and then called `SLACK_CLIENT.auth_test` — a live
-HTTPS request to slack.com — while loading initializers. That made the app unbootable and
-the test suite unrunnable without valid credentials and internet. The Slack client is now
-built lazily inside `SlackNotifier`, and an unconfigured channel degrades to
-`NullNotifier` instead of raising.
+No change to the controller, the service, the job or the model. Classes are registered by name and
+resolved lazily, so registration works from an initializer without fighting Zeitwerk. A channel
+reporting `configured? == false` is swapped for `NullNotifier` rather than raising — that is why an
+unconfigured deployment records events instead of crashing. The suite drives its own doubles
+through the same seam, so a broken seam breaks the tests.
 
-**Delivery is recorded after it happens, not before.** `notified_at` is written only once
-Slack has accepted the message. The job checks `notified?` before sending, so a retry or a
-replayed webhook cannot produce a second alert, and a failure leaves an accurate
-`notification_error` and `notification_attempts` rather than a report that claims to have
-been delivered.
+## Known gaps
 
-**Replays are a first-class case.** Providers retry a webhook on any non-2xx response.
-Each event gets a SHA-256 `event_key` derived from its identifying fields, backed by a
-unique index. A replay is a cheap `200` with `duplicate: true`; a race between two
-concurrent deliveries is lost gracefully by catching `RecordNotUnique` and returning the
-row that won.
-
-**The bottleneck was the request cycle, not the database.** This service does one insert
-per request; there is no N+1 to find. What it *did* do was make a synchronous HTTPS call to
-Slack inside `after_create_commit`, so every request's latency was Slack's latency and any
-Slack error propagated out of the transaction callback — the caller got a `500` even though
-the row was committed, which made the provider retry and create a duplicate. Moving
-delivery to `SpamNotificationJob` decouples ingest throughput from Slack entirely; the
-indexes added alongside it (`event_key` unique, `[report_type, type_code, bounced_at]`, and
-a partial index on un-notified rows) keep the replay lookup and the sweep constant-time as
-the table grows.
-
-**Failures are isolated per report.** One job per report means a revoked token or a
-channel-not-found for one alert cannot abort any other. `retry_on` covers
-`Notifier::DeliveryError` only, so a genuine bug in our own code fails loudly on the first
-attempt instead of being retried five times.
-
-**One extension seam, not five.** `NotifierRegistry` is the seam a future developer would
-actually reach for: adding email, PagerDuty or an internal webhook is one class that
-implements `deliver` plus one `register` call, with no change to the controller, the
-service or the job. The test suite uses that seam for its own doubles, which keeps it
-honest.
-
-**The enum vocabulary is the provider's.** `Type` is stored as `report_type` because
-`type` is reserved by Active Record for single-table inheritance, and aliased back so the
-webhook's own field name still works. An unrecognised `Type` used to raise `ArgumentError`
-out of the enum setter and return an empty `500`; it is now an ordinary validation error
-with a message naming the four accepted values.
-
----
-
-## Limitations
-
-- **One endpoint.** Events can be ingested but not read back: there is no list, search or
-  analytics API and no UI. An earlier version of this README advertised "analyze spam
-  notifications"; no such endpoint ever existed.
-- **The default queue is not durable.** `ACTIVE_JOB_ADAPTER=async` runs jobs in-process and
-  loses anything queued when the process exits. `bin/rails notifications:sweep` re-queues
-  alerts that never went out, but a real deployment should point `ACTIVE_JOB_ADAPTER` at
+- **Write-only.** Events go in and cannot be read back: no list, no search, no analytics, no UI.
+- **The default queue is not durable.** `ACTIVE_JOB_ADAPTER=async` runs jobs in-process and loses
+  anything queued when the process exits — visible in `docs/pipeline-evidence.md`, where the seed's
+  alerts survive only because `notifications:sweep` can find them again. A real deployment wants
   Sidekiq, GoodJob or Solid Queue.
-- **Authentication is a shared secret, not a signature.** Postmark offers HTTP Basic
-  credentials in the webhook URL, which is what this implements. A provider that signs its
-  payloads would warrant verifying the signature instead.
-- **No rate limiting.** A flood of valid events will be ingested as fast as the database
-  allows. Rack::Attack or an upstream limit would be the next addition.
-- **Alert text is fixed.** The Slack message is a single `I18n` string with no formatting
-  blocks, threading, or per-channel routing.
-- **Retention is unbounded.** Reports are never pruned; a production deployment would want
-  a retention policy or partitioning.
-- **Docker is unbuilt.** The image and compose file are written to a good standard but have
-  only been parse-checked, not built or run.
+- **A shared secret is not a signature.** A provider that signs its payloads would warrant
+  verifying the signature instead.
+- **No rate limiting.** A flood of *valid* events is ingested as fast as the database allows.
+- **Retention is unbounded** and the alert text is a single `I18n` string — no blocks, threading or
+  per-channel routing.
+- **Generator weight.** `require "rails/all"` still loads Action Cable, Action Mailbox, Action Text
+  and Active Storage, none of which this service uses, along with the `app/channels`, `app/mailers`
+  and `config/cable.yml` they expect. Explicit requires would boot faster and ship smaller.
+- **Docker is unbuilt** — see the note above.
